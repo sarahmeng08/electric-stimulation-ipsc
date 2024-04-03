@@ -1,0 +1,332 @@
+---
+title: "iPSC Electric Stimulation"
+output: html_document
+date: "2024-04-03"
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import Libraries
+
+```{r}
+library(DESeq2)
+library(EnhancedVolcano)
+library("pheatmap")
+library(reshape2)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(biomaRt)
+library(dplyr)
+library(tidyr)
+library(viridis)
+library(rstatix)
+library(openxlsx)
+library(readxl)
+library(data.table)
+library(ggpubr)
+library(RColorBrewer)
+library(fgsea)
+library(xml2)
+library(XML)
+
+```
+
+# Run Differential Gene Expression
+
+## Import Files
+
+```{r}
+# countmatrix<-read.delim("./data/ReadsPerGene.merged.tsv")
+countmatrix<-as.data.frame(read_excel("./data/gene_count_avg.xlsx",sheet="Sheet2"))
+
+```
+
+## Create Expression Dataframe
+
+```{r}
+
+rownames(countmatrix)<-countmatrix$gene_name
+countmatrix$gene_name<-NULL
+genenames<-rownames(countmatrix)
+
+
+# Create metadata for DESEQ2
+meta<-cbind(colnames(countmatrix),c("Control","Control","1Hz","1Hz", "Frequency Ramped", "Frequency Ramped"))
+colnames(meta)<-c('samples','condition')
+
+# filter samples with low counts and low variance
+countmatrix$sums = rowSums(countmatrix)
+countmatrix$vars = rowVars(as.matrix(countmatrix))
+newdat <- countmatrix[countmatrix$sums >= 6 & countmatrix$vars >= 50, ]
+countmatrix <- newdat %>% select(-sums, -vars)
+
+```
+
+
+
+## Run DESEQ2
+
+```{r}
+
+
+dds <- DESeqDataSetFromMatrix(countData=countmatrix, 
+                              colData=meta, 
+                              design=~condition)
+
+dds <- DESeq(dds)
+
+# Plot PCA
+vsdata <- vst(dds, blind=FALSE)
+
+# Compare Control and 1hz
+res <- results(dds, contrast=c("condition","Control","1Hz"))
+res <- lfcShrink(dds,  contrast = c("condition","Control","1Hz"), res=res, type="ashr")
+
+# Compare Control and ramp
+res1 <- results(dds, contrast=c("condition","Control","Frequency Ramped"))
+res1 <- lfcShrink(dds,  contrast = c("condition","Control","Frequency Ramped"), res=res1, type="ashr")
+
+# Compare 1hz and ramp
+res2 <- results(dds, contrast=c("condition","1Hz","Frequency Ramped"))
+res2 <- lfcShrink(dds,  contrast = c("condition","1Hz","Frequency Ramped"), res=res2, type="ashr")
+
+
+
+# Plot Volcano Plots
+EnhancedVolcano(res,
+                lab = rownames(res),
+                x = 'log2FoldChange',
+                y = 'padj')
+
+
+EnhancedVolcano(res1,
+                lab = rownames(res1),
+                x = 'log2FoldChange',
+                y = 'padj')
+
+EnhancedVolcano(res2,
+                lab = rownames(res2),
+                x = 'log2FoldChange',
+                y = 'padj')
+
+```
+
+## Plot PCA
+
+```{r}
+gg_color = c(`Control` = "#000000", `1Hz`= "#EA3368", `Frequency Ramped` = "#3A057A")
+pcaData <- plotPCA(vsdata, intgroup=c("condition"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=condition)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed()+
+  scale_color_manual(values = gg_color)+theme(text = element_text(size = 18),legend.position = "bottom")
+
+
+```
+
+## Create list of significant genes
+``` {r}
+
+# Keep only the significantly differentiated genes where the fold-change was at least 1 (for exploratory analysis)
+
+deseq2ResDF <- as.data.frame(res)
+sigGenes <- deseq2ResDF[deseq2ResDF$padj <= .05 & abs(deseq2ResDF$log2FoldChange) > 1,]
+
+
+deseq2ResDF1 <- as.data.frame(res1)
+sigGenes1 <- deseq2ResDF1[deseq2ResDF1$padj <= .05 & abs(deseq2ResDF1$log2FoldChange) > 1,]
+
+
+deseq2ResDF2 <- as.data.frame(res2)
+sigGenes2 <- deseq2ResDF2[deseq2ResDF2$padj <= .05 & abs(deseq2ResDF2$log2FoldChange) > 1,]
+
+```
+
+
+
+## Create files to input into GSEA
+```{r}
+df<-sigGenes
+gene_list <- df$log2FoldChange
+names(gene_list) <- rownames(df)
+gene_list <-gene_list[complete.cases(gene_list)]
+
+df<-sigGenes1
+gene_list1 <- df$log2FoldChange
+names(gene_list1) <- rownames(df)
+gene_list1 <-gene_list1[complete.cases(gene_list1)]
+
+df<-sigGenes2
+gene_list2 <- df$log2FoldChange
+names(gene_list2) <- rownames(df)
+gene_list2 <-gene_list2[complete.cases(gene_list2)]
+
+# Write files
+write.csv(gene_list,'./data/sigGenes/sigGenes_Control_vs_1hz.csv')
+write.csv(gene_list1,'./data/sigGenes/sigGenes_Control_vs_ramp.csv')
+write.csv(gene_list2,'./data/sigGenes/sigGenes_1hz_vs_ramp.csv')
+```
+
+
+## Import pathway files
+
+```{r}
+pathways.c5_bp <- gmtPathways("./pathways/c5.go.bp.v2023.2.Hs.symbols.gmt")
+```
+
+
+
+
+## Control vs 1hz
+```{r}
+fgseaRes_c5_bp <- fgseaMultilevel(pathways=pathways.c5_bp, stats=gene_list,
+                               minSize = 1,
+                               maxSize = 500,
+                               eps = 0,
+                               nPermSimple = 10000)
+
+fgseaRes_c5_bp<-fgseaRes_c5_bp[fgseaRes_c5_bp$padj<=0.05,]
+
+fgseaResTidy_c5_bp <- fgseaRes_c5_bp %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+fgseaResTidy_c5_bp$pathway <- str_replace_all(fgseaResTidy_c5_bp$pathway, c("GOBP"="", "_"=" "))
+
+ggplot(fgseaResTidy_c5_bp, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=NES)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Enriched GO Biological Process Ontology Pathways") + 
+  theme_minimal()+theme(text = element_text(size = 18))+ scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,limits =c(-3.4,3.4))
+
+```
+
+
+## Control vs Ramp
+```{r}
+
+fgseaRes_c5_bp <- fgseaMultilevel(pathways=pathways.c5_bp, stats=gene_list1,
+                               minSize = 1,
+                               maxSize = 500,
+                               eps = 0,
+                               nPermSimple = 10000)
+fgseaRes_c5_bp<-fgseaRes_c5_bp[fgseaRes_c5_bp$padj<=0.05,]
+
+fgseaResTidy_c5_bp <- fgseaRes_c5_bp %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+fgseaResTidy_c5_bp$pathway <- str_replace_all(fgseaResTidy_c5_bp$pathway, c("GOBP"="", "_"=" "))
+
+ggplot(fgseaResTidy_c5_bp, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=NES)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Enriched GO Biological Process Ontology Pathways") + 
+  theme_minimal()+theme(text = element_text(size = 12))+ scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,limits =c(-3.4,3.4))
+
+```
+
+
+
+
+
+## 1Hz vs ramp
+```{r}
+fgseaRes_c5_bp <- fgseaMultilevel(pathways=pathways.c5_bp, stats=gene_list2,
+                               minSize = 1,
+                               maxSize = 500,
+                               eps = 0,
+                               nPermSimple = 10000)
+fgseaRes_c5_bp<-fgseaRes_c5_bp[fgseaRes_c5_bp$padj<=0.05,]
+
+fgseaResTidy_c5_bp <- fgseaRes_c5_bp %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+fgseaResTidy_c5_bp$pathway <- str_replace_all(fgseaResTidy_c5_bp$pathway, c("GOBP"="", "_"=" "))
+
+ggplot(fgseaResTidy_c5_bp, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=NES)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Enriched GO Biological Process Ontology Pathways") + 
+  theme_minimal()+theme(text = element_text(size = 18))+ scale_fill_gradient2(low = "#2166AC", mid = "#F7F7F7", high = "#B2182B", midpoint = 0,limits =c(-3.4,3.4))
+
+```
+## define cardiac maturity genes
+
+```{r}
+
+genes_markers<- c('TNNT2', "TNNT1", "TNNT3", "MYH6", "MYH7", "CACNA1C", "KCND3", "KCNJ2","SLC8A","ATP2A2","RYR2","GJA1","MLY2","MLY7","ACTC1","NPPA","NPPB","MYBPC3","ACTN2","TTN")
+
+
+```
+
+
+
+
+
+```{r}
+vsdata <- vst(dds, blind=FALSE)
+vsdata <- assay(vsdata)
+vsdata <- as.data.frame(vsdata)
+vsdata$gene <- rownames(vsdata)
+
+
+heat_count<-vsdata[rownames(vsdata) %in% genes_markers,]
+heat_count$gene<-rownames(heat_count)
+heat_count<- as.data.frame(heat_count)
+rownames(heat_count) <- heat_count$gene
+heat_count$gene <-NULL
+
+
+anno_color = list(
+    condition = c(`Control` = "#000000", `1Hz`= "#EA3368", `Frequency Ramped` = "#3A057A"))
+
+labels_col = c("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "")
+
+meta_anno <- as.data.frame(meta)
+rownames(meta_anno) <- meta_anno$samples
+meta_anno$samples <-  NULL
+
+pheatmap(heat_count_7, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         color = brewer.pal(n = 11, name = "RdBu"),
+         main = "Cardiac Maturity Genes",
+         fontsize_row = 8, fontsize_col = 8,scale="row",
+         annotation_col = meta_anno,
+        annotation_colors = anno_color,labels_col = labels_col
+         )
+
+
+
+
+
+```
+
+
+
+```{r}
+rld <- rlog(dds, blind=FALSE)
+topVarGenes <- head(order(rowVars(assay(rld)),decreasing=TRUE),50)
+
+
+anno_color = list(
+    condition = c(`Control` = "#000000", `1Hz`= "#EA3368", `Frequency Ramped` = "#3A057A"))
+
+
+labels_col = c("", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "")
+
+mat <- assay(rld)[ topVarGenes, ]
+mat <- mat - rowMeans(mat)
+df <- meta_anno
+pheatmap(mat, annotation_col=df,annotation_colors = anno_color,
+        labels_col = labels_col)
+```
